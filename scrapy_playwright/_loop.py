@@ -36,7 +36,9 @@ class _ThreadedLoopAdapter:
 
         try:
             result = await queue_item.coro
-        except Exception as exc:
+        except BaseException as exc:
+            # BaseException (not Exception): CancelledError must settle the
+            # Deferred too, otherwise a cancelled crawl leaves it pending.
             reactor.callFromThread(dfd.errback, failure.Failure(exc))
         else:
             reactor.callFromThread(dfd.callback, result)
@@ -47,7 +49,9 @@ class _ThreadedLoopAdapter:
         loop: asyncio.AbstractEventLoop = queue_item.loop  # type: ignore[assignment]
         try:
             result = await queue_item.coro
-        except Exception as exc:
+        except BaseException as exc:
+            # BaseException (not Exception): a CancelledError from a cancelled
+            # crawl must still settle the future instead of escaping the task.
             loop.call_soon_threadsafe(future.set_exception, exc)
         else:
             loop.call_soon_threadsafe(future.set_result, result)

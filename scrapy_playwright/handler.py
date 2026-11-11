@@ -88,6 +88,18 @@ class BrowserContextWrapper:
     context: BrowserContext
     semaphore: asyncio.Semaphore
     persistent: bool
+    # Set once the context is known to be gone (close event, browser
+    # disconnection or handler shutdown). Acquirable page slots of a dead
+    # context must not be awaited on forever: see _acquire_page_slot.
+    closed: asyncio.Event = dataclass_field(default_factory=asyncio.Event)
+    # Guards the context-level semaphore so the "close" event, which may fire
+    # more than once, releases its slot at most once.
+    context_slot_released: bool = False
+    # Pages created by the handler that currently hold a semaphore slot.
+    # Removal (not repeated calls) makes page "close"/"crash" releases
+    # idempotent and keeps stale events of replaced contexts from touching
+    # the resources of a same-named replacement context.
+    page_slots: set = dataclass_field(default_factory=set)
 
 
 @dataclass
@@ -268,6 +280,7 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
         if hasattr(self, "context_semaphore"):
             await self.context_semaphore.acquire()
             acquired = True
+        context = None
         try:
             context_kwargs = context_kwargs or {}
             persistent = remote = False
@@ -278,13 +291,28 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
                 await self._maybe_launch_browser()
                 context = await self.browser.new_context(**context_kwargs)
                 remote = bool(self.config.cdp_url or self.config.connect_url)
-        except Exception:
+        except BaseException:
+            # includes CancelledError: a cancelled launch must not keep the
+            # context slot, and must not leave an orphaned browser context
             if acquired:
                 self.context_semaphore.release()
+            if context is not None:
+                with suppress(Exception):
+                    await context.close()
             raise
 
+        wrapper = BrowserContextWrapper(
+            context=context,
+            semaphore=asyncio.Semaphore(value=self.config.max_pages_per_context),
+            persistent=persistent,
+        )
+        # everything between context creation and this assignment is synchronous,
+        # so a cancellation cannot strand a created context without a wrapper
         context.on(
-            "close", self._make_close_browser_context_callback(name, persistent, remote, spider)
+            "close",
+            self._make_close_browser_context_callback(
+                name=name, wrapper=wrapper, persistent=persistent, remote=remote, spider=spider
+            ),
         )
         self.stats.inc_value("playwright/context_count")
         self.stats.inc_value(f"playwright/context_count/persistent/{persistent}")
@@ -303,13 +331,48 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
         )
         if self.config.navigation_timeout_ms is not None:
             context.set_default_navigation_timeout(self.config.navigation_timeout_ms)
-        self.context_wrappers[name] = BrowserContextWrapper(
-            context=context,
-            semaphore=asyncio.Semaphore(value=self.config.max_pages_per_context),
-            persistent=persistent,
-        )
+        self.context_wrappers[name] = wrapper
         self._set_stats_max_concurrent_context_count()
-        return self.context_wrappers[name]
+        return wrapper
+
+    async def _acquire_page_slot(self, ctx_wrapper: BrowserContextWrapper) -> None:
+        """Acquire a page slot, failing fast if the context dies while waiting.
+
+        A plain ``semaphore.acquire()`` would wait forever when the context is
+        closed (or the browser disconnects) before a slot frees up: the pages
+        holding the slots are gone, so no "close" event can ever release them.
+        Racing the acquisition against the wrapper's ``closed`` event makes the
+        waiter end with a clear error instead of hanging; the raised
+        :class:`TargetClosedError` is picked up by the regular retry logic.
+        """
+        acquire_task = asyncio.ensure_future(ctx_wrapper.semaphore.acquire())
+        closed_task = asyncio.ensure_future(ctx_wrapper.closed.wait())
+        try:
+            await asyncio.wait(
+                {acquire_task, closed_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except BaseException:
+            # the waiter itself was cancelled while blocked on the slot
+            for task in (acquire_task, closed_task):
+                if not task.done():
+                    task.cancel()
+            for task in (acquire_task, closed_task):
+                with suppress(asyncio.CancelledError, Exception):
+                    await task
+            raise
+        if acquire_task.done():
+            closed_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await closed_task
+            # propagate an acquisition failure instead of pretending the slot is held
+            acquire_task.result()
+            return
+        # the context was closed (or is closing): do not take the slot with us
+        acquire_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await acquire_task
+        raise TargetClosedError("Browser context has been closed")
 
     async def _create_page(self, request: Request, spider: Spider) -> Page:
         """Create a new page in a context, also creating a new context if necessary."""
@@ -325,10 +388,11 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
                     spider=spider,
                 )
 
-        await ctx_wrapper.semaphore.acquire()
+        await self._acquire_page_slot(ctx_wrapper)
         try:
             page = await ctx_wrapper.context.new_page()
-        except Exception:
+        except BaseException:
+            # new_page() failed or was cancelled: hand the slot back explicitly
             ctx_wrapper.semaphore.release()
             raise
         self.stats.inc_value("playwright/page_count")
@@ -352,9 +416,20 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
         if self.config.navigation_timeout_ms is not None:
             page.set_default_navigation_timeout(self.config.navigation_timeout_ms)
 
-        close_page_callback = self._make_close_page_callback(context_name)
-        page.on("close", close_page_callback)
-        page.on("crash", close_page_callback)
+        # bind the release to this exact page and wrapper: the slot is released
+        # once, whichever terminal event ("close" or "crash") arrives first, and
+        # late events of an old context can never touch a same-named replacement.
+        ctx_wrapper.page_slots.add(page)
+
+        def release_page_slot() -> None:
+            # discard(): idempotent against duplicate "close"/"crash" events and
+            # against an already-rebuilt wrapper holding a fresh set of pages
+            if page in ctx_wrapper.page_slots:
+                ctx_wrapper.page_slots.discard(page)
+                ctx_wrapper.semaphore.release()
+
+        page.on("close", release_page_slot)
+        page.on("crash", release_page_slot)
         page.on("request", self._increment_request_stats)
         page.on("response", self._increment_response_stats)
         if logger.getEffectiveLevel() <= logging.DEBUG:
@@ -362,6 +437,19 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
             page.on("response", _make_response_logger(context_name, spider))
 
         return page
+
+    def _release_page_slot(self, page: Page) -> None:
+        """Release the page slot held by ``page``, if it was self-created.
+
+        Idempotent: safe to call from request cleanup and from the page's own
+        "close"/"crash" events. Pages supplied by the caller through
+        ``playwright_page`` are not tracked here, so they are left untouched.
+        """
+        for ctx_wrapper in self.context_wrappers.values():
+            if page in ctx_wrapper.page_slots:
+                ctx_wrapper.page_slots.discard(page)
+                ctx_wrapper.semaphore.release()
+                return
 
     def _get_total_page_count(self):
         return sum(len(ctx.context.pages) for ctx in self.context_wrappers.values())
@@ -398,6 +486,8 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
                 _ThreadedLoopAdapter.stop(id(self))
 
     async def _close(self) -> None:
+        for ctx_wrapper in self.context_wrappers.values():
+            ctx_wrapper.closed.set()
         with suppress(TargetClosedError):
             await asyncio.gather(*[ctx.context.close() for ctx in self.context_wrappers.values()])
         self.context_wrappers.clear()
@@ -452,47 +542,62 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
     async def _download_request_with_retry(self, request: Request, spider: Spider) -> Response:
         page = request.meta.get("playwright_page")
         page_created = False
-        if not isinstance(page, Page) or page.is_closed():
-            page = await self._create_page(request=request, spider=spider)
-            page_created = True
         context_name = request.meta.setdefault("playwright_context", DEFAULT_CONTEXT_NAME)
-
-        _attach_page_event_handlers(
-            page=page, request=request, spider=spider, context_name=context_name
-        )
-
-        # We need to identify the Playwright request that matches the Scrapy request
-        # in order to override method and body if necessary.
-        # Checking the URL and Request.is_navigation_request() is not enough, e.g.
-        # requests produced by submitting forms can produce false positives.
-        # Let's track only the first request that matches the above conditions.
-        initial_request_done = asyncio.Event()
-
-        # nothing to unroute if the page was just created
-        if not page_created:
-            await page.unroute("**")
-        await page.route(
-            "**",
-            self._make_request_handler(
-                context_name=context_name,
-                method=request.method,
-                url=request.url,
-                headers=request.headers,
-                body=request.body,
-                encoding=request.encoding,
-                spider=spider,
-                initial_request_done=initial_request_done,
-            ),
-        )
-
-        await _maybe_execute_page_init_callback(
-            page=page, request=request, context_name=context_name, spider=spider
-        )
-
         try:
+            if not isinstance(page, Page) or page.is_closed():
+                page = await self._create_page(request=request, spider=spider)
+                page_created = True
+
+            _attach_page_event_handlers(
+                page=page, request=request, spider=spider, context_name=context_name
+            )
+
+            # We need to identify the Playwright request that matches the Scrapy request
+            # in order to override method and body if necessary.
+            # Checking the URL and Request.is_navigation_request() is not enough, e.g.
+            # requests produced by submitting forms can produce false positives.
+            # Let's track only the first request that matches the above conditions.
+            initial_request_done = asyncio.Event()
+
+            # nothing to unroute if the page was just created
+            if not page_created:
+                await page.unroute("**")
+            await page.route(
+                "**",
+                self._make_request_handler(
+                    context_name=context_name,
+                    method=request.method,
+                    url=request.url,
+                    headers=request.headers,
+                    body=request.body,
+                    encoding=request.encoding,
+                    spider=spider,
+                    initial_request_done=initial_request_done,
+                ),
+            )
+
+            await _maybe_execute_page_init_callback(
+                page=page, request=request, context_name=context_name, spider=spider
+            )
+
             return await self._download_request_with_page(request, page, spider)
-        except Exception as ex:
-            if not request.meta.get("playwright_include_page") and not page.is_closed():
+        except BaseException as ex:
+            if isinstance(ex, asyncio.CancelledError):
+                # A cancellation is a terminal outcome, not a retryable failure:
+                # let it propagate. A page created by this handler is still closed
+                # (and its slot returned); a page supplied by the caller through
+                # playwright_page is never closed on our behalf.
+                if page_created:
+                    self._release_page_slot(page)
+                    with suppress(Exception):
+                        await page.close()
+                        self.stats.inc_value("playwright/page_count/closed")
+                raise
+            if (
+                isinstance(page, Page)
+                and not request.meta.get("playwright_include_page")
+                and not page.is_closed()
+            ):
                 logger.warning(
                     "Closing page due to failed request: %s exc_type=%s exc_msg=%s",
                     request,
@@ -565,6 +670,9 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
 
         if not request.meta.get("playwright_include_page"):
             await page.close()
+            # return the slot deterministically; the "close" event release is a
+            # no-op if the event has already been (or will later be) delivered
+            self._release_page_slot(page)
             self.stats.inc_value("playwright/page_count/closed")
 
         if download:
@@ -787,28 +895,49 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
         self.stats.inc_value(f"{stats_prefix}/method/{response.request.method}")
 
     async def _browser_disconnected_callback(self) -> None:
-        close_context_coros = [
-            ctx_wrapper.context.close() for ctx_wrapper in self.context_wrappers.values()
-        ]
+        wrappers = list(self.context_wrappers.values())
+        # mark dead first: requests waiting on a page slot must fail (and retry
+        # on the restarted browser) instead of waiting on events that never come
+        for ctx_wrapper in wrappers:
+            ctx_wrapper.closed.set()
         with suppress(TargetClosedError):
-            await asyncio.gather(*close_context_coros)
-        self.context_wrappers.clear()
+            await asyncio.gather(*[ctx_wrapper.context.close() for ctx_wrapper in wrappers])
+        # the "close" events release each context slot exactly once through
+        # _make_close_browser_context_callback; clean up wrappers whose event
+        # never fired (already-dead contexts), releasing their slot ourselves
+        for ctx_wrapper in wrappers:
+            if ctx_wrapper.context_slot_released:
+                continue
+            ctx_wrapper.context_slot_released = True
+            self.context_wrappers = {
+                name: wrapper
+                for name, wrapper in self.context_wrappers.items()
+                if wrapper is not ctx_wrapper
+            }
+            if hasattr(self, "context_semaphore"):
+                self.context_semaphore.release()
         logger.debug("Browser disconnected")
         if self.config.restart_disconnected_browser:
             del self.browser
 
-    def _make_close_page_callback(self, context_name: str) -> Callable:
-        def close_page_callback() -> None:
-            if context_name in self.context_wrappers:
-                self.context_wrappers[context_name].semaphore.release()
-
-        return close_page_callback
-
     def _make_close_browser_context_callback(
-        self, name: str, persistent: bool, remote: bool, spider: Optional[Spider] = None
+        self,
+        name: str,
+        wrapper: BrowserContextWrapper,
+        persistent: bool,
+        remote: bool,
+        spider: Optional[Spider] = None,
     ) -> Callable:
         def close_browser_context_callback() -> None:
-            self.context_wrappers.pop(name, None)
+            # bound to this exact wrapper: a late "close" event of a context that
+            # was replaced by a same-named successor releases neither the new
+            # context's slot nor its pages, and duplicate events release once.
+            wrapper.closed.set()
+            if wrapper.context_slot_released:
+                return
+            wrapper.context_slot_released = True
+            if self.context_wrappers.get(name) is wrapper:
+                del self.context_wrappers[name]
             if hasattr(self, "context_semaphore"):
                 self.context_semaphore.release()
             logger.debug(

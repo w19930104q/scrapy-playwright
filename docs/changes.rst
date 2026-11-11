@@ -5,6 +5,27 @@ Release notes
 Deprecated features are supported for at least six months following the
 release that deprecated them. After that, they may be removed at any time.
 
+(unreleased)
+============
+
+-   Fix page/context quota lifecycle so that closing or cancelling a browser
+    crawl can never exhaust the quota available to later requests.
+
+    *   Cancelling a request while it is waiting on a quota, creating a
+        context/page, running the page init callback or navigating now ends
+        with a cancellation and returns every slot it had taken. A page
+        created by the handler is closed on cancellation; a page supplied by
+        the caller through ``playwright_page`` is never closed by the handler.
+    *   Page ``close``/``crash`` events and context ``close`` events release
+        their semaphore slot exactly once, however many times or in what
+        order they arrive.
+    *   After a context is rebuilt under the same name, late events from the
+        old object can neither release the new context's quota nor remove the
+        new context from the handler.
+    *   Requests blocked waiting for a page slot fail fast (via the existing
+        ``TargetClosedError`` retry path, or an explicit failure) when their
+        context is closed or the browser disconnects, instead of hanging.
+
 0.0.48 (2026-07-10)
 ===================
 
