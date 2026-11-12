@@ -46,6 +46,7 @@ from twisted.internet.defer import Deferred, inlineCallbacks
 
 from scrapy_playwright import __version__
 from scrapy_playwright.headers import use_scrapy_headers
+from scrapy_playwright.navigation_headers import NavigationHeaderIsolation
 from scrapy_playwright.page import PageMethod
 from scrapy_playwright._loop import _ThreadedLoopAdapter
 from scrapy_playwright._utils import (
@@ -56,6 +57,7 @@ from scrapy_playwright._utils import (
     _is_safe_close_error,
     _make_request_logger,
     _make_response_logger,
+    _maybe_abort_route_request,
     _maybe_await,
     _maybe_execute_page_init_callback,
     _set_redirect_meta,
@@ -117,6 +119,7 @@ class Config:
     navigation_timeout_ms: Optional[float]
     download_timeout_secs: float
     restart_disconnected_browser: bool
+    navigation_header_isolation: bool = False
     target_closed_max_retries: int = 3
     use_threaded_loop: bool = False
 
@@ -144,9 +147,19 @@ class Config:
             restart_disconnected_browser=settings.getbool(
                 "PLAYWRIGHT_RESTART_DISCONNECTED_BROWSER", default=True
             ),
+            navigation_header_isolation=settings.getbool(
+                "PLAYWRIGHT_NAVIGATION_HEADER_ISOLATION", default=False
+            ),
             use_threaded_loop=platform.system() == "Windows"
             or settings.getbool("_PLAYWRIGHT_THREADED_LOOP", False),
         )
+        if cfg.navigation_header_isolation and cfg.browser_type_name != DEFAULT_BROWSER_TYPE:
+            msg = (
+                "PLAYWRIGHT_NAVIGATION_HEADER_ISOLATION is only supported"
+                f" with {DEFAULT_BROWSER_TYPE!r}, got {cfg.browser_type_name!r}"
+            )
+            logger.error(msg)
+            raise NotSupported(msg)
         cfg.cdp_kwargs.pop("endpoint_url", None)
         cfg.connect_kwargs.pop("ws_endpoint", None)
         if not cfg.max_pages_per_context:
@@ -461,6 +474,23 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
             page=page, request=request, spider=spider, context_name=context_name
         )
 
+        # Isolation only changes the default header strategy: a custom
+        # PLAYWRIGHT_PROCESS_REQUEST_HEADERS callback (or None) keeps full control,
+        # so no CDP interception is installed for it and no filtering is added.
+        navigation_isolation: Optional[NavigationHeaderIsolation] = None
+        isolation_active = (
+            self.config.navigation_header_isolation
+            and self.process_request_headers is use_scrapy_headers
+        )
+        if isolation_active:
+            navigation_isolation = NavigationHeaderIsolation(
+                page=page,
+                scrapy_headers=request.headers,
+                scrapy_method=request.method,
+                scrapy_body=request.body,
+            )
+            await navigation_isolation.start()
+
         # We need to identify the Playwright request that matches the Scrapy request
         # in order to override method and body if necessary.
         # Checking the URL and Request.is_navigation_request() is not enough, e.g.
@@ -482,6 +512,7 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
                 encoding=request.encoding,
                 spider=spider,
                 initial_request_done=initial_request_done,
+                navigation_header_isolation=navigation_isolation is not None,
             ),
         )
 
@@ -510,6 +541,9 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
                 await page.close()
                 self.stats.inc_value("playwright/page_count/closed")
             raise
+        finally:
+            if navigation_isolation is not None:
+                await navigation_isolation.close()
 
     async def _download_request_with_page(
         self, request: Request, page: Page, spider: Spider
@@ -828,6 +862,7 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
 
     def _make_request_handler(
         self,
+        *,
         context_name: str,
         method: str,
         url: str,
@@ -836,30 +871,28 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
         encoding: str,
         spider: Spider,
         initial_request_done: asyncio.Event,
+        navigation_header_isolation: bool = False,
     ) -> Callable:
         async def _request_handler(route: Route, playwright_request: PlaywrightRequest) -> None:
             """Override request headers, method and body."""
-            if self.abort_request:
-                should_abort = await _maybe_await(self.abort_request(playwright_request))
-                if should_abort:
-                    await route.abort()
-                    if logger.getEffectiveLevel() <= logging.DEBUG:
-                        logger.debug(
-                            "[Context=%s] Aborted Playwright request <%s %s>",
-                            context_name,
-                            playwright_request.method.upper(),
-                            playwright_request.url,
-                            extra={
-                                "spider": spider,
-                                "context_name": context_name,
-                                "scrapy_request_url": url,
-                                "scrapy_request_method": method,
-                                "playwright_request_url": playwright_request.url,
-                                "playwright_request_method": playwright_request.method,
-                            },
-                        )
-                    self.stats.inc_value("playwright/request_count/aborted")
-                    return None
+            if await _maybe_abort_route_request(
+                abort_request=self.abort_request,
+                stats=self.stats,
+                route=route,
+                playwright_request=playwright_request,
+                context_name=context_name,
+                spider=spider,
+                url=url,
+                method=method,
+            ):
+                return None
+
+            # Isolation handles main-frame documents and their redirect chain via
+            # CDP; continue them without Playwright overrides. Other requests
+            # (subresources, PageMethod navigations) still get the UA override.
+            if navigation_header_isolation and playwright_request.is_navigation_request():
+                await route.continue_()
+                return None
 
             overrides: dict = {}
 

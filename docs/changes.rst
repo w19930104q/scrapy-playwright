@@ -5,6 +5,16 @@ Release notes
 Deprecated features are supported for at least six months following the
 release that deprecated them. After that, they may be removed at any time.
 
+Unreleased
+==========
+
+-   Add the ``PLAYWRIGHT_NAVIGATION_HEADER_ISOLATION`` setting (Chromium only).
+    When enabled, the explicit Scrapy request headers are only injected into
+    the initial main-frame navigation and its same-origin redirect chain. The
+    ``Authorization`` and ``X-Api-Key`` headers are permanently stripped once
+    the chain goes cross-origin, even if it later returns to the original
+    origin. Origins are compared by scheme, host and effective port.
+
 0.0.48 (2026-07-10)
 ===================
 

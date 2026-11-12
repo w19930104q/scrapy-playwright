@@ -6,6 +6,7 @@ from playwright.async_api import (
     Page,
     Request as PlaywrightRequest,
     Response as PlaywrightResponse,
+    Route,
 )
 from scrapy import Spider
 from scrapy.http import Request as ScrapyRequest
@@ -23,6 +24,45 @@ async def _maybe_await(obj):
     if isinstance(obj, Awaitable):
         return await obj
     return obj
+
+
+async def _maybe_abort_route_request(
+    *,
+    abort_request: Optional[Callable],
+    stats,
+    route: Route,
+    playwright_request: PlaywrightRequest,
+    context_name: str,
+    spider: Spider,
+    url: str,
+    method: str,
+) -> bool:
+    """Abort the routed request if the abort predicate matches it.
+
+    Returns True if the request was aborted (and therefore fully handled).
+    """
+    if not abort_request:
+        return False
+    if not await _maybe_await(abort_request(playwright_request)):
+        return False
+    await route.abort()
+    if logger.getEffectiveLevel() <= logging.DEBUG:
+        logger.debug(
+            "[Context=%s] Aborted Playwright request <%s %s>",
+            context_name,
+            playwright_request.method.upper(),
+            playwright_request.url,
+            extra={
+                "spider": spider,
+                "context_name": context_name,
+                "scrapy_request_url": url,
+                "scrapy_request_method": method,
+                "playwright_request_url": playwright_request.url,
+                "playwright_request_method": playwright_request.method,
+            },
+        )
+    stats.inc_value("playwright/request_count/aborted")
+    return True
 
 
 def _possible_encodings(headers: Headers, text: str) -> Iterator[str]:

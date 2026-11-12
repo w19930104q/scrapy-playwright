@@ -296,6 +296,62 @@ Maximum amount of concurrent Playwright pages for each context.
 See :ref:`page-objects` for the risks of leaving pages unclosed.
 
 
+.. setting:: PLAYWRIGHT_NAVIGATION_HEADER_ISOLATION
+
+PLAYWRIGHT_NAVIGATION_HEADER_ISOLATION
+======================================
+
+Type: :class:`bool`
+
+Default: ``False``
+
+Only supported on Chromium. Enabling it with any other browser type raises a
+:class:`~scrapy.exceptions.NotSupported` exception while building the
+:class:`~scrapy_playwright.handler.Config`.
+
+When enabled, the headers explicitly set on the Scrapy request are only
+injected into the initial main-frame navigation and the redirect chain it
+starts. This relies on the Chrome DevTools Protocol ``Fetch`` domain, which
+(and unlike Playwright's routing API) intercepts every request of a redirect
+chain individually.
+
+Behavior:
+
+-   The explicit Scrapy headers are sent on the initial navigation and on every
+    same-origin hop of its redirect chain. Origins are compared by scheme, host
+    and effective port.
+
+-   As soon as the chain becomes cross-origin, the ``Authorization`` and
+    ``X-Api-Key`` headers are permanently stripped from the chain. They are not
+    restored if a later redirect goes back to the original origin. Other
+    explicit headers keep following the chain.
+
+-   Iframe documents, subresources and new main-frame navigations triggered by
+    :ref:`page-methods` are not part of the Scrapy navigation chain. They keep
+    the browser-managed headers and only inherit the Scrapy ``User-Agent``.
+
+-   Reusing a page (see :ref:`page-objects`) does not leak the headers of the
+    previous request: each Scrapy request gets its own isolated interception
+    state.
+
+-   Forbidden headers such as ``Cookie`` or ``Content-Length`` cannot be
+    overridden and remain managed by the browser. The cookie jar still decides
+    which cookies are sent.
+
+-   On ``303 See Other`` redirects the browser switches to ``GET`` and drops the
+    request body; ``307 Temporary Redirect`` and ``308 Permanent Redirect`` keep
+    the method and the body, as usual.
+
+A custom :setting:`PLAYWRIGHT_PROCESS_REQUEST_HEADERS` callback, or setting that
+option to ``None``, still takes full control of the header strategy: this
+setting only changes the default behavior and does not add extra filtering to a
+custom callback.
+
+.. code-block:: python
+
+    PLAYWRIGHT_NAVIGATION_HEADER_ISOLATION = True
+
+
 .. setting:: PLAYWRIGHT_PROCESS_REQUEST_HEADERS
 
 PLAYWRIGHT_PROCESS_REQUEST_HEADERS
